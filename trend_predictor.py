@@ -143,17 +143,21 @@ def process_image_with_progress(args):
     """
     Process a single image and update the progress bar
     Args:
-        args: Tuple containing (image_path, system_prompt, user_prompt, pbar, token_counter, api_key)
+        args: Tuple containing (image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter)
     Returns:
-        bool: True if processed, False if skipped or error
+        bool: True if processed or skipped (existing), False if error
     """
-    image_path, system_prompt, user_prompt, pbar, token_counter, api_key = args
+    image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter = args
     try:
         # Check if result already exists
         result_path = get_result_path(image_path)
         if os.path.exists(result_path):
+            with existing_counter['lock']:
+                existing_counter['count'] += 1
+                if existing_counter['count'] % 50 == 0:  # Print every 50 existing files
+                    logger.info(f"Found {existing_counter['count']} existing results so far...")
             pbar.update(1)
-            return False
+            return True  # Changed from False to True - existing file is a successful outcome
         
         # Extract date from filename (assuming format like 20250118_60.png)
         filename = os.path.basename(image_path)
@@ -225,6 +229,7 @@ def batch_process_images(threads=1):
             pending_files.append(image_path)
     
     print(f"Found {existing_count} existing results, {len(pending_files)} files to process")
+    print(f"Overall progress: {existing_count}/{len(png_files)} ({existing_count/len(png_files)*100:.1f}%) already complete")
     
     if len(pending_files) == 0:
         print("No files to process!")
@@ -262,36 +267,39 @@ def batch_process_images(threads=1):
     # Initialize token counter
     token_counter = TokenCounter()
     
-    # Create progress bar
-    pbar = tqdm.tqdm(total=len(pending_files), desc="Processing images", position=0, leave=True)
+    # Create progress bar for ALL files (not just pending), starting from existing count
+    pbar = tqdm.tqdm(total=len(png_files), desc="Processing images", position=0, leave=True, initial=existing_count)
+    
+    # Counter for tracking existing files found during processing
+    existing_counter = {'count': 0, 'lock': threading.Lock()}
     
     # Process images
-    processed_count = 0
+    new_processed_count = 0  # Only newly processed files
     failed_count = 0
     
     if threads <= 1:
         # Sequential processing
         for image_path in pending_files:
-            args = (image_path, system_prompt, user_prompt, pbar, token_counter, api_key)
+            args = (image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter)
             success = process_image_with_progress(args)
             if success:
-                processed_count += 1
+                new_processed_count += 1
             else:
                 failed_count += 1
     else:
         # Parallel processing
-        args_list = [(image_path, system_prompt, user_prompt, pbar, token_counter, api_key) for image_path in pending_files]
+        args_list = [(image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter) for image_path in pending_files]
         with ThreadPoolExecutor(max_workers=threads) as executor:
             results = list(executor.map(process_image_with_progress, args_list))
-            processed_count = sum(1 for r in results if r)
+            new_processed_count = sum(1 for r in results if r)
             failed_count = sum(1 for r in results if not r)
     
     pbar.close()
     
     # Print final summary
     total_files = len(png_files)
-    total_existing = existing_count
-    total_processed = processed_count
+    total_existing = existing_count + existing_counter['count']  # Pre-existing + found during processing
+    total_processed = new_processed_count
     total_failed = failed_count
     
     print(f"\n=== Processing Complete ===")
