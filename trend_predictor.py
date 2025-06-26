@@ -8,6 +8,40 @@ import glob
 import os
 from datetime import datetime
 import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import logging
+import threading
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class TokenCounter:
+    """Track token usage over time with rate limiting awareness"""
+    def __init__(self, tpm_limit=200000):  # 200k tokens per minute default
+        self.tpm_limit = tpm_limit
+        self.tokens_history = []  # List of (timestamp, token_count) tuples
+        self.lock = threading.Lock()
+    
+    def add_tokens(self, tokens):
+        """Add tokens used in a request"""
+        with self.lock:
+            current_time = time.time()
+            self.tokens_history.append((current_time, tokens))
+            # Clean up old entries (older than 1 minute)
+            cutoff_time = current_time - 60
+            self.tokens_history = [(t, c) for t, c in self.tokens_history if t > cutoff_time]
+    
+    def get_last_minute_usage(self):
+        """Get token usage in the last minute"""
+        with self.lock:
+            current_time = time.time()
+            cutoff_time = current_time - 60
+            recent_tokens = [count for timestamp, count in self.tokens_history if timestamp > cutoff_time]
+            total_tokens = sum(recent_tokens)
+            percentage = (total_tokens / self.tpm_limit) * 100 if self.tpm_limit > 0 else 0
+            return total_tokens, percentage
 
 def append_message(messages, role, text, image_url):
     messages.append(
@@ -60,10 +94,8 @@ class TrendAnalysis(BaseModel):
         description="Estimated short term likelihood (0 to 1) of trend continuation with same characteristics vs stagnation or reversal"
     )
 
-def predict(system_prompt, user_prompt, image_path):
+def predict(system_prompt, user_prompt, image_path, token_counter=None, api_key=None):
     model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano-2025-04-14")
-    
-    api_key = os.environ.get("OPENAI_API_KEY")
     client = OpenAI(api_key=api_key)
     messages=[
                 {"role": "system", "content": system_prompt},
@@ -88,15 +120,88 @@ def predict(system_prompt, user_prompt, image_path):
     response = completion.choices[0].message
     response_object = response.parsed
     response_json = json.loads(response.content)
+    
+    # Add token counting
+    if token_counter is not None and hasattr(completion, 'usage') and completion.usage:
+        token_counter.add_tokens(completion.usage.total_tokens)
+        total, percent = token_counter.get_last_minute_usage()
+        logger.info(f"Tokens used in last minute: {total} ({percent:.2f}% of TPM limit)")
+    
     return response_object, response_json, completion
 
-def batch_process_images():
-    """Process all PNG files from data and data_ directories and save results to CSV"""
+def get_result_path(image_path):
+    """Get the path where individual result should be saved"""
+    # Extract symbol from path like "data/plots/SNPS/20250513_60.png"
+    path_parts = image_path.split(os.sep)
+    symbol = path_parts[-2]  # Get the symbol (second to last part)
     
+    filename = os.path.basename(image_path)
+    name_without_ext = os.path.splitext(filename)[0]
+    return f"data/results/{symbol}/{name_without_ext}.json"
+
+def process_image_with_progress(args):
+    """
+    Process a single image and update the progress bar
+    Args:
+        args: Tuple containing (image_path, system_prompt, user_prompt, pbar, token_counter, api_key)
+    Returns:
+        bool: True if processed, False if skipped or error
+    """
+    image_path, system_prompt, user_prompt, pbar, token_counter, api_key = args
+    try:
+        # Check if result already exists
+        result_path = get_result_path(image_path)
+        if os.path.exists(result_path):
+            pbar.update(1)
+            return False
+        
+        # Extract date from filename (assuming format like 20250118_60.png)
+        filename = os.path.basename(image_path)
+        date_str = filename.split('_')[0]  # Extract date part
+        
+        logger.info(f"Processing {filename}...")
+        
+        # Run trend analysis
+        trend_analysis, response_json, completion = predict(system_prompt, user_prompt, image_path, token_counter, api_key)
+        
+        # Store results
+        result = {
+            'filename': filename,
+            'filepath': image_path,
+            'date': date_str,
+            'direction': trend_analysis.direction,
+            'trend_duration': trend_analysis.trend_duration,
+            'trend_vulnerability_score': trend_analysis.trend_vulnerability_score,
+            'price_positioning': trend_analysis.price_positioning,
+            'continuation_likelihood': trend_analysis.continuation_likelihood,
+            'processed_at': datetime.now().isoformat()
+        }
+        
+        # Save individual result to JSON file
+        os.makedirs(os.path.dirname(result_path), exist_ok=True)  # Create symbol directory
+        with open(result_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        
+        logger.info(f"✓ Saved to {result_path}")
+        pbar.update(1)
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Error processing {image_path}: {str(e)}")
+        pbar.update(1)
+        return False
+
+def batch_process_images(threads=1):
+    """Process all PNG files from data and data_ directories and save individual results to JSON files"""
+    
+    api_key = os.environ.get("OPENAI_API_KEY", None)
+    if api_key is None:
+        raise ValueError("OPENAI_API_KEY is not set")
+
     # Get all PNG files from both directories
     png_files = []
     # png_files.extend(glob.glob("data/*.png"))
-    png_files.extend(glob.glob("data/plots/*.png"))
+    png_files.extend(glob.glob("data/plots/**/*.png", recursive=True))
     # png_files.extend(glob.glob("data_/*.png"))
     
     # Remove duplicates (in case same files exist in multiple directories)
@@ -105,9 +210,26 @@ def batch_process_images():
     
     print(f"Found {len(png_files)} PNG files to process")
     
-    # Initialize results list
-    results = []
+    # Create directory for results
+    os.makedirs("data/results", exist_ok=True)
     
+    # Count existing and pending files
+    existing_count = 0
+    pending_files = []
+    
+    for image_path in png_files:
+        result_path = get_result_path(image_path)
+        if os.path.exists(result_path):
+            existing_count += 1
+        else:
+            pending_files.append(image_path)
+    
+    print(f"Found {existing_count} existing results, {len(pending_files)} files to process")
+    
+    if len(pending_files) == 0:
+        print("No files to process!")
+        return 0, 0
+
     system_prompt = """
     You are a quantitative finance analyst with deep expertise in technical analysis, pattern recognition, and market structure. Your primary task is to analyze candlestick charts using visual features such as price action, volatility, and support/resistance behavior.
 
@@ -126,9 +248,9 @@ def batch_process_images():
 
     2. **TREND DURATION** — Count how many candles the identified trend lasted up to the final candle in the chart.
 
-    3. **TREND VULNERABILITY SCORE (TVS)** — Estimate the fraction of the trend’s duration since its start that would be negated by a single 2-standard-deviation move against the trend, based on realized volatility inside the recognized trend channel. Values close to and above 1 indicate fragile trends; values near 0 indicate robust trends. Score saturates at 1.
+    3. **TREND VULNERABILITY SCORE (TVS)** — Estimate the fraction of the trend's duration since its start that would be negated by a single 2-standard-deviation move against the trend, based on realized volatility inside the recognized trend channel. Values close to and above 1 indicate fragile trends; values near 0 indicate robust trends. Score saturates at 1.
 
-    4. **PRICE POSITIONING** — Assess the current price’s location within the identified trend corridor:
+    4. **PRICE POSITIONING** — Assess the current price's location within the identified trend corridor:
        -  0 = on the trendline (support in an uptrend, resistance in a downtrend)
        - <0 = price has broken against the trend (e.g., below support in an uptrend)
        -  1 = at the upper (uptrend) or lower (downtrend) boundary of the channel
@@ -137,82 +259,61 @@ def batch_process_images():
     5. **CONTINUATION LIKELIHOOD** — Estimate the probability (0 to 1) that the trend will continue in the same direction versus reversing or consolidating in the short term.
     """
     
-    # Process each image
-    for i, image_path in tqdm.tqdm(enumerate(png_files), total=len(png_files)):
-        try:
-            # Extract date from filename (assuming format like 20250118_60.png)
-            filename = os.path.basename(image_path)
-            date_str = filename.split('_')[0]  # Extract date part
-            
-            # Run trend analysis
-            trend_analysis, response_json, completion = predict(system_prompt, user_prompt, image_path)
-            
-            # Store results
-            result = {
-                'filename': filename,
-                'filepath': image_path,
-                'date': date_str,
-                'direction': trend_analysis.direction,
-                'trend_duration': trend_analysis.trend_duration,
-                'trend_vulnerability_score': trend_analysis.trend_vulnerability_score,
-                'price_positioning': trend_analysis.price_positioning,
-                'continuation_likelihood': trend_analysis.continuation_likelihood,
-                'processed_at': datetime.now().isoformat()
-            }
-            results.append(result)
-            
-            # print(f"  - Direction: {trend_analysis.direction:.3f}")
-            # print(f"  - Trend duration: {trend_analysis.trend_duration} days")
-            # print(f"  - TVS: {trend_analysis.trend_vulnerability_score:.3f}")
-            # print(f"  - Price positioning: {trend_analysis.price_positioning:.3f}")
-            # print(f"  - Continuation likelihood: {trend_analysis.continuation_likelihood:.3f}")
-            
-        except Exception as e:
-            print(f"  - Error processing {image_path}: {str(e)}")
-            # Store error result
-            result = {
-                'filename': filename,
-                'filepath': image_path,
-                'date': date_str if 'date_str' in locals() else 'unknown',
-                'direction': None,
-                'trend_duration': None,
-                'trend_vulnerability_score': None,
-                'price_positioning': None,
-                'continuation_likelihood': None,
-                'processed_at': datetime.now().isoformat(),
-                'error': str(e)
-            }
-            results.append(result)
+    # Initialize token counter
+    token_counter = TokenCounter()
     
-    # Create DataFrame
-    df = pd.DataFrame(results)
+    # Create progress bar
+    pbar = tqdm.tqdm(total=len(pending_files), desc="Processing images", position=0, leave=True)
     
-    # Create timestamp for filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"data/reports/{timestamp}.csv"
+    # Process images
+    processed_count = 0
+    failed_count = 0
     
-    # Save to CSV
-    df.to_csv(output_path, index=False)
-    print(f"\nResults saved to {output_path}")
-    print(f"Processed {len(results)} files")
+    if threads <= 1:
+        # Sequential processing
+        for image_path in pending_files:
+            args = (image_path, system_prompt, user_prompt, pbar, token_counter, api_key)
+            success = process_image_with_progress(args)
+            if success:
+                processed_count += 1
+            else:
+                failed_count += 1
+    else:
+        # Parallel processing
+        args_list = [(image_path, system_prompt, user_prompt, pbar, token_counter, api_key) for image_path in pending_files]
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            results = list(executor.map(process_image_with_progress, args_list))
+            processed_count = sum(1 for r in results if r)
+            failed_count = sum(1 for r in results if not r)
     
-    # Display summary statistics
-    if len(df) > 0:
-        print("\nSummary Statistics:")
-        print(f"Average direction: {df['direction'].mean():.3f}")
-        print(f"Average trend duration: {df['trend_duration'].mean():.1f} days")
-        print(f"Average TVS: {df['trend_vulnerability_score'].mean():.3f}")
-        print(f"Average price positioning: {df['price_positioning'].mean():.3f}")
-        print(f"Average continuation likelihood: {df['continuation_likelihood'].mean():.3f}")
-        print(f"Successful predictions: {df['direction'].notna().sum()}")
-        print(f"Failed predictions: {df['direction'].isna().sum()}")
+    pbar.close()
     
-    return df, output_path
+    # Print final summary
+    total_files = len(png_files)
+    total_existing = existing_count
+    total_processed = processed_count
+    total_failed = failed_count
+    
+    print(f"\n=== Processing Complete ===")
+    print(f"Total files found: {total_files}")
+    print(f"Previously completed: {total_existing}")
+    print(f"Newly processed: {total_processed}")
+    print(f"Failed: {total_failed}")
+    print(f"Total completed: {total_existing + total_processed}")
+    
+    if total_processed > 0:
+        print(f"\nNewly processed results saved to symbol-specific JSON files in: data/results/{{symbol}}/")
+        print(f"Use a separate script to collect all results into a single CSV file.")
+    
+    return total_processed, total_failed
 
-def main():
+def main(threads=1):
     # Process all images in batch
-    df, output_path = batch_process_images()
-    return df, output_path
+    processed, failed = batch_process_images(threads=threads)
+    return processed, failed
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Trend Predictor - Batch Image Processing')
+    parser.add_argument('--threads', type=int, default=1, help='Number of threads for parallel processing')
+    args = parser.parse_args()
+    main(threads=args.threads)
