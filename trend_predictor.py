@@ -17,9 +17,12 @@ import time
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress httpx INFO messages (HTTP request logs)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 class TokenCounter:
     """Track token usage over time with rate limiting awareness"""
-    def __init__(self, tpm_limit=200000):  # 200k tokens per minute default
+    def __init__(self, tpm_limit=150000000):  # 150M tokens per minute default
         self.tpm_limit = tpm_limit
         self.tokens_history = []  # List of (timestamp, token_count) tuples
         self.lock = threading.Lock()
@@ -94,12 +97,19 @@ class TrendAnalysis(BaseModel):
         description="Estimated short term likelihood (0 to 1) of trend continuation with same characteristics vs stagnation or reversal"
     )
 
-def predict(system_prompt, user_prompt, image_path, token_counter=None, api_key=None):
-    model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano-2025-04-14")
-    client = OpenAI(api_key=api_key)
-    messages=[
-                {"role": "system", "content": system_prompt},
-            ]
+def predict(system_prompt, user_prompt, image_path, token_counter=None, api_key=None, client=None):
+    """
+    Predict using OpenAI API with optional pre-created client
+    """
+    if client is None:
+        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano-2025-04-14")
+        client = OpenAI(api_key=api_key, timeout=600)
+    else:
+        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano-2025-04-14")
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
     base64_image = encode_image(image_path)
     image_url = f"data:image/jpeg;base64,{base64_image}"    
     append_message(
@@ -109,25 +119,34 @@ def predict(system_prompt, user_prompt, image_path, token_counter=None, api_key=
         image_url
     )
 
-    kwargs = dict(
-            model=model,
-            messages=messages,
-        )
+    # Build kwargs properly with correct types
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "response_format": TrendAnalysis
+    }
+    
+    # Only add temperature for non-o3 models
     if model != 'o3':
         kwargs['temperature'] = 0.0
-    kwargs["response_format"] = TrendAnalysis
+    
     completion = client.beta.chat.completions.parse(**kwargs)    
     response = completion.choices[0].message
     response_object = response.parsed
-    response_json = json.loads(response.content)
+    
+    # Safe JSON parsing
+    response_json = None
+    if response.content:
+        response_json = json.loads(response.content)
     
     # Add token counting
+    token_info = None
     if token_counter is not None and hasattr(completion, 'usage') and completion.usage:
         token_counter.add_tokens(completion.usage.total_tokens)
         total, percent = token_counter.get_last_minute_usage()
-        logger.info(f"Tokens used in last minute: {total} ({percent:.2f}% of TPM limit)")
+        token_info = (total, percent)
     
-    return response_object, response_json, completion
+    return response_object, response_json, completion, token_info
 
 def get_result_path(image_path):
     """Get the path where individual result should be saved"""
@@ -139,15 +158,28 @@ def get_result_path(image_path):
     name_without_ext = os.path.splitext(filename)[0]
     return f"data/results/{symbol}/{name_without_ext}.json"
 
-def process_image_with_progress(args):
+# Thread-local storage for OpenAI clients
+_thread_local = threading.local()
+
+def get_thread_client(api_key):
+    """Get or create thread-local OpenAI client"""
+    if not hasattr(_thread_local, 'openai_client'):
+        _thread_local.openai_client = OpenAI(api_key=api_key, timeout=600)
+    return _thread_local.openai_client
+
+def process_image_with_progress_threaded(args):
     """
-    Process a single image and update the progress bar
+    Process a single image with thread-local client creation
     Args:
         args: Tuple containing (image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter)
     Returns:
         bool: True if processed or skipped (existing), False if error
     """
     image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter = args
+    
+    # Get thread-local client (one per worker thread, not per image)
+    client = get_thread_client(api_key)
+    
     try:
         # Check if result already exists
         result_path = get_result_path(image_path)
@@ -157,16 +189,20 @@ def process_image_with_progress(args):
                 if existing_counter['count'] % 50 == 0:  # Print every 50 existing files
                     logger.info(f"Found {existing_counter['count']} existing results so far...")
             pbar.update(1)
-            return True  # Changed from False to True - existing file is a successful outcome
+            return True
         
         # Extract date from filename (assuming format like 20250118_60.png)
         filename = os.path.basename(image_path)
         date_str = filename.split('_')[0]  # Extract date part
         
-        logger.info(f"Processing {filename}...")
+        # Run trend analysis with thread-local client
+        trend_analysis, response_json, completion, token_info = predict(system_prompt, user_prompt, image_path, token_counter, client=client)
         
-        # Run trend analysis
-        trend_analysis, response_json, completion = predict(system_prompt, user_prompt, image_path, token_counter, api_key)
+        # Check if trend analysis was successful
+        if trend_analysis is None:
+            logger.error(f"✗ Failed to get trend analysis for {image_path}")
+            pbar.update(1)
+            return False
         
         # Store results
         result = {
@@ -186,7 +222,12 @@ def process_image_with_progress(args):
         with open(result_path, 'w') as f:
             json.dump(result, f, indent=2)
         
-        logger.info(f"✓ Saved to {result_path}")
+        # Update progress bar with last saved file and token usage
+        postfix_parts = [f"✓ {os.path.basename(result_path)}"]
+        if token_info:
+            total, percent = token_info
+            postfix_parts.append(f"Tokens: {total} ({percent:.1f}%)")
+        pbar.set_postfix_str(" | ".join(postfix_parts))
         pbar.update(1)
         return True
         
@@ -278,19 +319,19 @@ def batch_process_images(threads=1):
     failed_count = 0
     
     if threads <= 1:
-        # Sequential processing
+        # Sequential processing - use thread-local client approach for consistency
         for image_path in pending_files:
             args = (image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter)
-            success = process_image_with_progress(args)
+            success = process_image_with_progress_threaded(args)
             if success:
                 new_processed_count += 1
             else:
                 failed_count += 1
     else:
-        # Parallel processing
+        # Parallel processing - thread-local clients will be created automatically
         args_list = [(image_path, system_prompt, user_prompt, pbar, token_counter, api_key, existing_counter) for image_path in pending_files]
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            results = list(executor.map(process_image_with_progress, args_list))
+            results = list(executor.map(process_image_with_progress_threaded, args_list))
             new_processed_count = sum(1 for r in results if r)
             failed_count = sum(1 for r in results if not r)
     
@@ -312,6 +353,8 @@ def batch_process_images(threads=1):
     if total_processed > 0:
         print(f"\nNewly processed results saved to symbol-specific JSON files in: data/results/{{symbol}}/")
         print(f"Use a separate script to collect all results into a single CSV file.")
+        print(f"\n✨ Performance improvement: Each worker thread now uses its own OpenAI client instance")
+        print(f"   to avoid bottlenecks and improve throughput with {threads} threads.")
     
     return total_processed, total_failed
 
